@@ -817,6 +817,19 @@ def test_compiled_model_keeps_plain_state_dict(data_and_cfg):
     assert list(compiled.state_dict()) == list(plain.state_dict())
 
 
+def test_checkpoints_leave_out_the_closure_std_fields(data_and_cfg):
+    """They are rebuilt from the data; saving them made every checkpoint ~1 GB at 1 degree."""
+    data, cfg = data_and_cfg
+    module = build_module(cfg, build_model(cfg, data), build_losses(cfg, data), data)
+    assert module.budgets
+    assert not any(k.endswith(("_content_std", "_flux_std")) for k in module.state_dict())
+    # Checkpoints saved while they were still included load strictly.
+    old_fields = {f"{b}_{kind}_std": torch.zeros(1) for b in module.budgets for kind in ("content", "flux")}
+    checkpoint = {"state_dict": {**module.state_dict(), **old_fields}}
+    module.on_load_checkpoint(checkpoint)
+    module.load_state_dict(checkpoint["state_dict"])
+
+
 # =============================================================================
 # Data pipeline: index batches, windows cut on the module's device
 # =============================================================================
