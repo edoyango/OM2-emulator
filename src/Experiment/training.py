@@ -21,7 +21,7 @@ from Emulator import total_rollout_loss
 
 from .config import rollout_spec
 from .data import gather_windows
-from .losses import closure_std_fields
+from .losses import closure_flux_fields, closure_std_fields
 
 
 def cuda_is_usable():
@@ -136,21 +136,28 @@ class EmulatorModule(L.LightningModule):
         self.register_buffer("forcing_z", f["forcing"].float(), persistent=False)
         self.register_buffer("mask", f["mask"].float())
         self.register_buffer("area", f["area"].float())
-        # Normalisation std fields that the closure terms use to turn z-scores
-        # into physical anomalies: (T, H, W) content and flux std per active
-        # budget. Only active budgets are kept, as each pair costs GPU memory.
-        # Not saved in checkpoints either: they are rebuilt from the data, and
-        # saving them made every checkpoint ~1 GB at 1 degree.
+        # Per active budget, what the closure terms need: the (T, H, W)
+        # content std, to turn z-scores into physical anomalies, and the
+        # area-integrated flux anomaly of every month (T,), so the flux side
+        # needs neither the flux std nor re-integrating the forcing. Not saved
+        # in checkpoints: they are rebuilt from the data, and saving the std
+        # fields made every checkpoint ~1 GB at 1 degree.
         self.budgets = []
-        for budget, (content_std, flux_std) in closure_std_fields(cfg, data).items():
+        flux = closure_flux_fields(cfg, data)
+        for budget, (content_std, _) in closure_std_fields(cfg, data).items():
             self.register_buffer(f"{budget}_content_std", content_std.float(), persistent=False)
-            self.register_buffer(f"{budget}_flux_std", flux_std.float(), persistent=False)
+            self.register_buffer(f"{budget}_global_flux", flux[budget], persistent=False)
             self.budgets.append(budget)
 
     @property
     def closure_std(self):
-        """{budget: (content_std, flux_std)} on the module's device."""
-        return {b: (getattr(self, f"{b}_content_std"), getattr(self, f"{b}_flux_std")) for b in self.budgets}
+        """{budget: (content_std, None)} on the module's device: the flux side uses closure_flux."""
+        return {b: (getattr(self, f"{b}_content_std"), None) for b in self.budgets}
+
+    @property
+    def closure_flux(self):
+        """{budget: (T,) area-integrated flux anomaly per month} on the module's device."""
+        return {b: getattr(self, f"{b}_global_flux") for b in self.budgets}
 
     def windows(self, t0, n_steps):
         """Rollout windows for initial months t0, cut on the module's device."""
@@ -205,6 +212,7 @@ class EmulatorModule(L.LightningModule):
             target_time_indices=batch["target_time_index"],
             area=self.area,
             closure_std=self.closure_std,
+            closure_flux=self.closure_flux,
             dt_seconds=self.dt_seconds,
             initial_forcing=batch["initial_forcing"],
             n_prognostic=self.n_prognostic,

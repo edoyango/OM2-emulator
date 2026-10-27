@@ -14,7 +14,7 @@ so ``step_weights`` shifts emphasis between lead times without changing the
 overall size of the loss.
 """
 
-from Emulator import budget_closure_loss, local_mse_loss, spectral_loss
+from Emulator import budget_closure_loss, global_flux_by_month, local_mse_loss, spectral_loss
 
 from .config import CLOSURE_SUFFIX, _is_active
 
@@ -42,6 +42,23 @@ def closure_std_fields(cfg, data):
         budget: (
             f["prognostic_std"][:, d.prognostic.index(closure.content_variable)],
             f["forcing_std"][:, d.forcing.index(closure.flux_variable)],
+        )
+        for budget, closure in cfg.active_closures().items()
+    }
+
+
+def closure_flux_fields(cfg, data):
+    """
+    {budget: (T,) float64} for every active closure: the area-integrated
+    surface-flux anomaly of every month, the rollout context's ``closure_flux``.
+    """
+    d, f = cfg.data, data.fields
+    return {
+        budget: global_flux_by_month(
+            f["forcing"][:, d.forcing.index(closure.flux_variable)],
+            f["forcing_std"][:, d.forcing.index(closure.flux_variable)],
+            f["area"],
+            f["mask"],
         )
         for budget, closure in cfg.active_closures().items()
     }
