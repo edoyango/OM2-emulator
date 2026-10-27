@@ -139,10 +139,12 @@ class EmulatorModule(L.LightningModule):
         # Normalisation std fields that the closure terms use to turn z-scores
         # into physical anomalies: (T, H, W) content and flux std per active
         # budget. Only active budgets are kept, as each pair costs GPU memory.
+        # Not saved in checkpoints either: they are rebuilt from the data, and
+        # saving them made every checkpoint ~1 GB at 1 degree.
         self.budgets = []
         for budget, (content_std, flux_std) in closure_std_fields(cfg, data).items():
-            self.register_buffer(f"{budget}_content_std", content_std.float())
-            self.register_buffer(f"{budget}_flux_std", flux_std.float())
+            self.register_buffer(f"{budget}_content_std", content_std.float(), persistent=False)
+            self.register_buffer(f"{budget}_flux_std", flux_std.float(), persistent=False)
             self.budgets.append(budget)
 
     @property
@@ -241,6 +243,13 @@ class EmulatorModule(L.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         return self._step(batch, self.valid_steps, "val")
+
+    def on_load_checkpoint(self, checkpoint):
+        # Checkpoints saved before the closure std fields were left out still
+        # hold them: drop them so that those checkpoints load strictly.
+        state = checkpoint.get("state_dict", {})
+        for key in [k for k in state if "." not in k and k.endswith(("_content_std", "_flux_std"))]:
+            del state[key]
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
