@@ -89,6 +89,11 @@ def nearest_ocean_index(mask2d):
     return index
 
 
+def _is_channels_last(x):
+    """True for a 4-D tensor stored channels_last (NHWC) rather than in the standard layout."""
+    return x.dim() == 4 and not x.is_contiguous() and x.is_contiguous(memory_format=torch.channels_last)
+
+
 def fill_land(x, mask, dirichlet=None, index=None):
     """
     Fill the land cells of x (B, C, H, W) before a convolution (see the comment
@@ -105,7 +110,7 @@ def fill_land(x, mask, dirichlet=None, index=None):
     mask2d = mask.reshape(-1, *mask.shape[-2:])[0]
     if index is None:
         index = nearest_ocean_index(mask2d)
-    channels_last = x.dim() == 4 and not x.is_contiguous() and x.is_contiguous(memory_format=torch.channels_last)
+    channels_last = _is_channels_last(x)
     if channels_last:
         # channels_last: gather along the flattened (H*W) axis of the NHWC
         # storage so the result stays channels_last.
@@ -113,7 +118,11 @@ def fill_land(x, mask, dirichlet=None, index=None):
         nhwc = x.permute(0, 2, 3, 1).reshape(b, h * w, c)
         filled = nhwc.index_select(1, index).view(b, h, w, c).permute(0, 3, 1, 2)
     else:
-        filled = x.flatten(-2)[..., index].view_as(x)
+        # index_select, not x[..., index]: the backward of advanced indexing
+        # (index_put_ with accumulate) sorts the indices, and is very slow here
+        # because many land cells share one nearest ocean cell. Decoder layers
+        # that fell back to it took about half the GPU time of a training step.
+        filled = x.flatten(-2).index_select(-1, index).view_as(x)
     if dirichlet:
         channels = torch.zeros(x.shape[1], dtype=torch.bool, device=x.device)
         values = torch.zeros(x.shape[1], dtype=x.dtype, device=x.device)
@@ -185,7 +194,7 @@ class PartialConv2d(nn.Module):
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, stride=stride)
 
     def forward(self, x, mask, fill_index=None):
-        channels_last = x.dim() == 4 and not x.is_contiguous() and x.is_contiguous(memory_format=torch.channels_last)
+        channels_last = _is_channels_last(x)
         x = fill_land(x, mask, self.dirichlet, index=fill_index)
         if self.padding:
             x = self._pad(x)
