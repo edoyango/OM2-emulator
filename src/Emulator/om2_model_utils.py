@@ -137,6 +137,68 @@ def fill_land(x, mask, dirichlet=None, index=None):
     return filled
 
 
+_PADDED_SOURCE_CACHE = {}
+
+
+def padded_source_index(h, w, padding, y_pad_mode, device):
+    """
+    The cell each cell of a padded (h + 2p, w + 2p) field copies, as a flat
+    (h * w) index into the unpadded field, row-major (see PartialConv2d._pad):
+    x is periodic, the ghost rows above the top row are the top rows reversed
+    in x and y (the tripole fold), and the south rows follow y_pad_mode. For
+    "constant" the south rows point at row 0: the caller zeroes them. Computed
+    once per grid and padding, and cached.
+    """
+    key = (h, w, padding, y_pad_mode, str(device))
+    index = _PADDED_SOURCE_CACHE.get(key)
+    if index is None:
+        p = padding
+        rows, cols = np.meshgrid(np.arange(h + 2 * p) - p, (np.arange(w + 2 * p) - p) % w, indexing="ij")
+        fold = rows >= h  # row h + k copies row h - 1 - k, reversed in x
+        rows, cols = np.where(fold, 2 * h - 1 - rows, rows), np.where(fold, w - 1 - cols, cols)
+        south = rows < 0
+        if y_pad_mode == "reflect":
+            rows = np.where(south, -rows, rows)
+        elif y_pad_mode == "circular":
+            rows = np.where(south, h + rows, rows)
+        elif y_pad_mode in ("constant", "replicate"):
+            rows = np.where(south, 0, rows)
+        else:
+            raise ValueError(f"Unknown y_pad_mode {y_pad_mode!r}")
+        index = torch.as_tensor((rows * w + cols).reshape(-1), dtype=torch.long, device=device)
+        if len(_PADDED_SOURCE_CACHE) > 64:
+            _PADDED_SOURCE_CACHE.clear()
+        _PADDED_SOURCE_CACHE[key] = index
+    return index
+
+
+class _GatherPadded(torch.autograd.Function):
+    """
+    source.index_select(dim, index) with the first n_zero entries along dim
+    set to zero (the constant south padding). The backward scatters only the
+    other entries back, so the padding costs neither pass a copy.
+    """
+
+    @staticmethod
+    def forward(ctx, source, index, dim, n_zero):
+        out = source.index_select(dim, index)
+        if n_zero:
+            out.narrow(dim, 0, n_zero).zero_()
+        ctx.save_for_backward(index)
+        ctx.dim, ctx.n_zero, ctx.source_size = dim, n_zero, source.shape[dim]
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        (index,) = ctx.saved_tensors
+        dim, n_zero = ctx.dim, ctx.n_zero
+        shape = list(grad.shape)
+        shape[dim] = ctx.source_size
+        grad_source = grad.new_zeros(shape)
+        grad_source.index_add_(dim, index[n_zero:], grad.narrow(dim, n_zero, grad.shape[dim] - n_zero))
+        return grad_source, None, None, None
+
+
 class PartialConv2d(nn.Module):
     """
     Mask-aware 2D convolution for ocean fields: fill land, then convolve.
@@ -194,15 +256,40 @@ class PartialConv2d(nn.Module):
         self.conv = nn.Conv2d(in_ch, out_ch, kernel_size=kernel_size, stride=stride)
 
     def forward(self, x, mask, fill_index=None):
-        channels_last = _is_channels_last(x)
-        x = fill_land(x, mask, self.dirichlet, index=fill_index)
-        if self.padding:
-            x = self._pad(x)
-            if channels_last:
-                x = x.contiguous(memory_format=torch.channels_last)
+        if self.padding and not self.dirichlet:
+            x = self._fill_and_pad(x, mask, fill_index)
+        else:
+            channels_last = _is_channels_last(x)
+            x = fill_land(x, mask, self.dirichlet, index=fill_index)
+            if self.padding:
+                x = self._pad(x)
+                if channels_last:
+                    x = x.contiguous(memory_format=torch.channels_last)
         out = self.conv(x)
         new_mask = mask if out.shape[-2:] == mask.shape[-2:] else F.adaptive_max_pool2d(mask, out.shape[-2:])
         return out, new_mask
+
+    def _fill_and_pad(self, x, mask, fill_index=None):
+        """
+        fill_land followed by _pad, as one gather: every padded cell copies one
+        input cell (its nearest ocean cell, across the seam and the fold). The
+        separate steps made about five copies of x in each pass (fill, south
+        pad, fold concatenation, circular pad, layout conversion). Same values;
+        a channels_last input gives a channels_last output.
+        """
+        b, c, h, w = x.shape
+        p = self.padding
+        if fill_index is None:
+            fill_index = nearest_ocean_index(mask.reshape(-1, h, w)[0])
+        index = fill_index[padded_source_index(h, w, p, self.y_pad_mode, x.device)]
+        n_zero = p * (w + 2 * p) if self.y_pad_mode == "constant" else 0
+        if _is_channels_last(x):
+            # Gather along the flattened (H*W) axis of the NHWC storage.
+            nhwc = x.permute(0, 2, 3, 1).reshape(b, h * w, c)
+            out = _GatherPadded.apply(nhwc, index, 1, n_zero)
+            return out.view(b, h + 2 * p, w + 2 * p, c).permute(0, 3, 1, 2)
+        out = _GatherPadded.apply(x.reshape(b, c, h * w), index, 2, n_zero)
+        return out.view(b, c, h + 2 * p, w + 2 * p)
 
     def _pad(self, t):
         """

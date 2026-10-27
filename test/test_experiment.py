@@ -675,6 +675,29 @@ def test_mask_aware_conv_fills_land_then_convolves(kernel_size, stride, padding)
         torch.testing.assert_close(new_mask[:1], torch.nn.functional.adaptive_max_pool2d(mask, out.shape[-2:]))
 
 
+@pytest.mark.parametrize("padding_mode", ["zeros", "replicate", "reflect", "circular"])
+@pytest.mark.parametrize("padding", [1, 2, 3])
+def test_fill_and_pad_is_fill_land_then_pad(padding_mode, padding):
+    """The one-gather fill + tripolar pad gives the same values and gradients as the separate steps."""
+    from Emulator import PartialConv2d
+    from Emulator.om2_model_utils import fill_land
+
+    torch.manual_seed(0)
+    layer = PartialConv2d(5, 6, 3, 1, padding, padding_mode=padding_mode)
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    for layout in (torch.contiguous_format, torch.channels_last):
+        x = torch.randn(2, 5, H, W).contiguous(memory_format=layout).requires_grad_()
+        x_ref = x.detach().clone().requires_grad_()
+        out = layer._fill_and_pad(x, mask)
+        expected = layer._pad(fill_land(x_ref, mask))
+        assert torch.equal(out, expected)
+        assert out.is_contiguous(memory_format=layout)
+        weight = torch.randn_like(expected)
+        (out * weight).sum().backward()
+        (expected * weight).sum().backward()
+        torch.testing.assert_close(x.grad, x_ref.grad)
+
+
 def test_output_ignores_input_values_on_land():
     """Land inputs are overwritten (Neumann or Dirichlet) before every layer, so they cannot affect the output."""
     from Emulator import UNet
