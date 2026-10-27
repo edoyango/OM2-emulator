@@ -1194,6 +1194,34 @@ def test_fill_land_keeps_channels_last():
     torch.testing.assert_close(out_cl, fill_land(x, mask, dirichlet={2: 0.5}))
 
 
+def test_unet_feeds_every_layer_channels_last():
+    """
+    With a channels_last input, every convolution must get a channels_last
+    input. Otherwise fill_land takes its standard-layout path and cuDNN
+    transposes the input: the decoder layers after upsample_periodic_x did
+    this, at about half the cost of a training step.
+    """
+    from Emulator import UNet
+    from Emulator.om2_model_utils import PartialConv2d, upsample_periodic_x
+
+    torch.manual_seed(0)
+    unet = UNet(input_channel_count=5, output_channel_count=2, padding_mode="zeros").to(memory_format=torch.channels_last)
+    layouts = {}
+    for name, module in unet.named_modules():
+        if isinstance(module, PartialConv2d):
+            module.register_forward_pre_hook(
+                lambda _, args, name=name: layouts.__setitem__(name, args[0].is_contiguous(memory_format=torch.channels_last))
+            )
+    mask = (torch.rand(1, 1, H, W) > 0.3).float()
+    unet(torch.randn(2, 5, H, W).contiguous(memory_format=torch.channels_last), mask)
+    assert layouts and all(layouts.values()), [name for name, ok in layouts.items() if not ok]
+
+    x = torch.randn(2, 3, 5, 10)
+    out = upsample_periodic_x(x.contiguous(memory_format=torch.channels_last), (10, 20))
+    assert out.is_contiguous(memory_format=torch.channels_last)
+    torch.testing.assert_close(out, upsample_periodic_x(x, (10, 20)))
+
+
 def test_local_mse_is_area_weighted():
     """Each cell's squared error counts in proportion to its area; without area every ocean cell counts equally."""
     from Emulator import local_mse_loss
