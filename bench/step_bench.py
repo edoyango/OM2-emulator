@@ -103,7 +103,7 @@ class Bench:
             self.run(stage, steps)
             torch.cuda.synchronize()
             times.append(time.perf_counter() - start)
-        return times, torch.cuda.max_memory_allocated()
+        return times, torch.cuda.max_memory_allocated(), torch.cuda.max_memory_reserved()
 
 
 # =============================================================================
@@ -253,12 +253,13 @@ def main():
             print(f"\n===== {stage} {text}")
             profile(bench, stage, steps, args.warmup, args.trace)
             continue
-        times, peak = bench.time(stage, steps, args.warmup, args.repeats)
+        times, peak, reserved = bench.time(stage, steps, args.warmup, args.repeats)
         n_free, n_scored = steps
         batch = len(bench.valid_t0 if stage == "val" else bench.train_t0)
         median = statistics.median(times)
         print(f"{stage:5s} {text:6s} batch {batch:3d} | {median * 1e3:8.1f} ms/batch (min {min(times) * 1e3:.1f}) | "
-              f"{median * 1e3 / n_scored:6.1f} ms per scored step | peak {peak / 2**30:5.2f} GiB")
+              f"{median * 1e3 / n_scored:6.1f} ms per scored step | peak {peak / 2**30:5.2f} GiB "
+              f"(reserved {reserved / 2**30:5.2f})")
 
 
 if __name__ == "__main__":
