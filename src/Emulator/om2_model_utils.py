@@ -226,18 +226,34 @@ def upsample_periodic_x(x, size):
     returns the standard layout, and the decoder layer after it would then
     take fill_land's standard-layout path and have its input transposed for
     cuDNN.
+
+    The output keeps the input's dtype, under autocast too (see _bilinear).
     """
     height, width = size
     scale = width // x.shape[-1]
     if scale * x.shape[-1] != width:
-        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
+        return _bilinear(x, size)
     channels_last = _is_channels_last(x)
     x = F.pad(x, (1, 1, 0, 0), mode="circular")
     if channels_last:
         x = x.contiguous(memory_format=torch.channels_last)
-    x = F.interpolate(x, size=(height, width + 2 * scale), mode="bilinear", align_corners=False)
+    x = _bilinear(x, (height, width + 2 * scale))
     x = x[..., scale:-scale]
     return x.contiguous(memory_format=torch.channels_last) if channels_last else x
+
+
+def _bilinear(x, size):
+    """
+    Bilinear interpolation in x's own dtype. Autocast runs upsampling in
+    float32, which made the three largest decoder tensors float32 (and the
+    skip connections concatenated with them) until the next convolution cast
+    them back: twice the bytes for every copy, pad and land fill, at full
+    resolution. The kernel accumulates in float32 either way, so an fp16
+    input gives the float32 result rounded to fp16, which is what that
+    convolution would have cast it to.
+    """
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        return F.interpolate(x, size=size, mode="bilinear", align_corners=False)
 
 
 class PartialConvStack(nn.Module):

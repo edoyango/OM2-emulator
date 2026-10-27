@@ -1222,6 +1222,25 @@ def test_unet_feeds_every_layer_channels_last():
     torch.testing.assert_close(out, upsample_periodic_x(x, (10, 20)))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA autocast")
+def test_periodic_upsampling_keeps_fp16_under_autocast():
+    """
+    CUDA autocast upsamples in float32, which made the largest decoder tensors
+    float32 until the next convolution. The fp16 result must equal the float32
+    one rounded to fp16, in both layouts.
+    """
+    from Emulator.om2_model_utils import upsample_periodic_x
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 16, 6, 10, device="cuda").half()
+    for layout in (torch.contiguous_format, torch.channels_last):
+        x = x.contiguous(memory_format=layout)
+        with torch.autocast("cuda", dtype=torch.float16):
+            out = upsample_periodic_x(x, (12, 20))
+        assert out.dtype == torch.float16
+        assert torch.equal(out, upsample_periodic_x(x.float(), (12, 20)).half())
+
+
 def test_local_mse_is_area_weighted():
     """Each cell's squared error counts in proportion to its area; without area every ocean cell counts equally."""
     from Emulator import local_mse_loss
