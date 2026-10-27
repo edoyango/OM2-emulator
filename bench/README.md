@@ -30,3 +30,10 @@ Run from the repo root on a GPU node, with nothing else on the GPU:
   (`1dcbae8`) with a given commit on one GPU, per batch and end to end:
   `qsub -q gpuhopper -P tm70 -v OPTIMISED=$(git rev-parse HEAD) bench/gadi_compare.pbs`
   (from the repo root; results in `runs/bench/<queue>_<job id>/`).
+- `bench/scan_batch_memory.py`: batch size x rollout memory setting (no
+  checkpointing, or the last k steps kept in memory) on one GPU, with the cost
+  per sample at every rollout stage, peak memory and the estimated training
+  time of the schedule. Loads the data once; out-of-memory settings are
+  recorded and skipped. `bench/gadi_scan.pbs` runs it as a Gadi batch job:
+  `qsub -q gpuhopper -P tm70 -v COMMIT=$(git rev-parse HEAD) bench/gadi_scan.pbs`
+  (results in `runs/bench/scan_<queue>_<job id>/`).
