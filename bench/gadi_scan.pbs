@@ -1,0 +1,39 @@
+#!/bin/bash
+# Batch size x rollout memory scan (scan_batch_memory.py) on one Gadi GPU, for
+# the code at commit COMMIT (taken from git, so the working tree does not
+# matter). Results: runs/bench/scan_<queue>_<job id>/ in the repo.
+#
+# Submit from the repo root, e.g. on an H200:
+#   qsub -q gpuhopper -P tm70 -v COMMIT=$(git rev-parse HEAD) bench/gadi_scan.pbs
+# SCAN_ARGS (via -v) replaces the default grid, e.g. SCAN_ARGS="--batches 64 128 --modes none 4".
+# Needs the repo's .venv and emulator_cache/; the storage line must cover the
+# repo, the venv and the data file.
+#PBS -q gpuhopper
+#PBS -l ngpus=1,ncpus=12,mem=96GB,jobfs=20GB,walltime=02:00:00
+#PBS -l storage=scratch/tm70+gdata/nm47
+#PBS -l wd
+#PBS -j oe
+#PBS -N om2-scan
+
+set -euo pipefail
+REPO=${PBS_O_WORKDIR:-$PWD}
+COMMIT=$(git -C "$REPO" rev-parse "${COMMIT:-HEAD}")
+QUEUE=${PBS_QUEUE:-local}
+OUT=$REPO/runs/bench/scan_${QUEUE%-exec}_${PBS_JOBID%%.*}
+mkdir -p "$OUT"
+
+module load python3/3.11.7
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+{
+    echo "commit $COMMIT"
+    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
+} | tee "$OUT/versions.txt"
+
+WORK=${PBS_JOBFS:-$(mktemp -d)}/code
+mkdir -p "$WORK"
+git -C "$REPO" archive "$COMMIT" | tar -x -C "$WORK"
+
+# shellcheck disable=SC2086  # SCAN_ARGS is a list of arguments
+"$REPO/.venv/bin/python" "$WORK/bench/scan_batch_memory.py" --set "data.cache_dir=$REPO/emulator_cache" \
+    --out "$OUT/scan.csv" ${SCAN_ARGS:---batches 16 32 64 96 128 186 372 --modes none 8 6 4 2 0} \
+    2>&1 | grep -v "expandable_segments: memory mapping failed" | tee "$OUT/scan.txt"
