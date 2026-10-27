@@ -175,6 +175,14 @@ def reference_case(bench, initial_state, text):
     stage, steps = parse_steps(text, bench.module)
     bench.logged.clear()
     loss = bench.run(stage, steps, optimizer_step=False)
+    # As in training, an fp16 overflow means the loss scale is too high: halve
+    # it and redo the batch (GradScaler would skip the step and back off).
+    while stage == "train" and bench.scaler.is_enabled() and not all(
+        torch.isfinite(p.grad).all() for p in bench.model.parameters() if p.grad is not None
+    ):
+        bench.scaler.update(bench.scaler.get_scale() / 2)
+        bench.logged.clear()
+        loss = bench.run(stage, steps, optimizer_step=False)
     scale = bench.scaler.get_scale() if bench.scaler.is_enabled() else 1.0
     grads = {} if stage == "val" else {
         name: (p.grad.float() / scale).cpu() for name, p in bench.model.named_parameters() if p.grad is not None
