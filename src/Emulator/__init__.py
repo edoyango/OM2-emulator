@@ -12,11 +12,13 @@ from .om2_loss_functions import (
     budget_closure_loss,
     freshwater_closure_loss,
     global_closure_loss,
+    global_flux_by_month,
     heat_closure_loss,
     local_mse_loss,
     spectral_loss,
     step_weight,
     total_rollout_loss,
+    window_flux_integral,
     zonal_wavenumber_bands,
 )
 
@@ -25,6 +27,7 @@ __all__ = [
     "budget_closure_loss",
     "freshwater_closure_loss",
     "global_closure_loss",
+    "global_flux_by_month",
     "heat_closure_loss",
     "IdentityLatentProcessor",
     "LatentResidualTuner",
@@ -37,5 +40,6 @@ __all__ = [
     "SpatialResidualHead",
     "total_rollout_loss",
     "UNet",
+    "window_flux_integral",
     "zonal_wavenumber_bands",
 ]

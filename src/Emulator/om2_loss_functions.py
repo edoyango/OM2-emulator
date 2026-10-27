@@ -13,7 +13,9 @@ from torch.utils.checkpoint import checkpoint
 
 def step_weight(weight, rollout_step, like):
     """
-    Return a scalar tensor weight for the current rollout step.
+    Return the weight for the current rollout step: a Python float, or a 0-d
+    tensor when ``weight`` is a tensor. A float keeps the callers' ``== 0.0``
+    checks from synchronising with the GPU at every step.
 
     ``weight`` may be either a scalar, applied to every rollout step, or a
     sequence/tensor with one entry per rollout step. This lets later forecast
@@ -49,18 +51,23 @@ def step_weight(weight, rollout_step, like):
         normaliser = sum(weight) / len(weight)
         if normaliser == 0.0:
             raise ValueError("Per-step loss weights must have non-zero mean")
-        return like.new_tensor(weight[rollout_step] / normaliser)
+        return float(weight[rollout_step] / normaliser)
 
-    return like.new_tensor(float(weight))
+    return float(weight)
 
 
-def expand_ocean_mask(mask, like):
+def broadcast_ocean_mask(mask, like):
+    """The ocean mask as (1, 1, H, W) or (B, 1, H, W), broadcastable to like (B, P, H, W)."""
     valid_mask = mask.to(device=like.device, dtype=like.dtype)
     if valid_mask.ndim == 2:
         valid_mask = valid_mask.unsqueeze(0).unsqueeze(0)
     elif valid_mask.ndim == 3:
         valid_mask = valid_mask.unsqueeze(1)
-    return valid_mask.expand_as(like)
+    return valid_mask
+
+
+def expand_ocean_mask(mask, like):
+    return broadcast_ocean_mask(mask, like).expand_as(like)
 
 
 def squeeze_field_axes(field):
@@ -96,10 +103,12 @@ def local_mse_loss(weight=1.0):
         if current_weight == 0.0:
             return pred_t.new_zeros(())
         step_err = (pred_t - target_t) ** 2
-        cell_weight = expand_ocean_mask(mask, step_err)
+        # Broadcast, not expanded: a (B, P, H, W) weight would be built and
+        # kept for the backward at every rollout step.
+        cell_weight = broadcast_ocean_mask(mask, step_err)
         if area is not None:
             cell_weight = cell_weight * area.to(device=step_err.device, dtype=step_err.dtype)
-        loss = (step_err * cell_weight).sum() / cell_weight.sum().clamp_min(1e-12)
+        loss = (step_err * cell_weight).sum() / cell_weight.expand_as(step_err).sum().clamp_min(1e-12)
         return current_weight * loss
 
     return loss_fn
@@ -224,6 +233,32 @@ def spectral_loss(weight=1.0, *, latitude):
     return loss_fn
 
 
+def global_flux_by_month(flux_norm, flux_std, area, mask, chunk=12):
+    """
+    The area-integrated surface-flux anomaly of every month,
+    sum_xy area * mask * flux_norm * flux_std, as a (T,) float64 tensor
+    (content units per second). flux_norm and flux_std are (T, H, W). Summed
+    a few months at a time, so the float64 temporaries stay small.
+    """
+    weight = (area * mask).to(torch.float64)
+    flux = torch.empty(flux_norm.shape[0], dtype=torch.float64, device=flux_norm.device)
+    for start in range(0, flux_norm.shape[0], chunk):
+        months = slice(start, start + chunk)
+        flux[months] = (flux_norm[months].double() * flux_std[months].double() * weight).sum(dim=(-2, -1))
+    return flux
+
+
+def window_flux_integral(global_flux, initial_time_index, target_time_index):
+    """
+    Trapezoid sum of a per-month global flux (T,) over each sample's window,
+    months t0 = initial_time_index ... t1 = target_time_index (consecutive):
+    1/2 at both ends, 1 in between (see budget_closure_loss).
+    """
+    cumulative = global_flux.cumsum(0)
+    t0, t1 = initial_time_index, target_time_index
+    return cumulative[t1] - cumulative[t0] + 0.5 * (global_flux[t0] - global_flux[t1])
+
+
 def budget_closure_loss(
     weight=1.0,
     budget=None,
@@ -255,6 +290,12 @@ def budget_closure_loss(
         budget=name : ``closure_std[name] = (content_std, flux_std)`` from the
                       rollout context, so several budgets can be used at once.
     Each std is (T, H, W), indexed with the sample's time indices.
+
+    ``closure_flux[name]`` in the rollout context, if given, is the
+    area-integrated flux anomaly of every month (T,) from global_flux_by_month.
+    The flux side then needs neither flux_std nor the forcing, and costs the
+    same at every step; without it, the forcing of every month in the window
+    is integrated at every step.
 
     ``min_scale`` is a floor (in content units x m^2, e.g. J or kg) on the
     normalisation scale of the residual; see the end of loss_fn.
@@ -331,6 +372,7 @@ def budget_closure_loss(
         ohc_std=None,
         forcing_std=None,
         closure_std=None,
+        closure_flux=None,
         initial_forcing=None,
         rollout_step=None,
         **_,
@@ -389,45 +431,59 @@ def budget_closure_loss(
         #   target month t0+n           -> weight 1/2  (forcing_history[:, -1])
         # forcing_history holds the flux for every month from the first target
         # up to the current target, so its last entry is the target month.
-        if initial_forcing is None:
-            raise ValueError(
-                f"The {name} needs `initial_forcing`: the forcing in the "
-                "initial month (time index target_time_indices[:, 0] - 1). The "
-                "two-month flux average uses half of it for the first step. Add it "
-                "to the rollout batch and pass it to total_rollout_loss."
-            )
-        n_history = forcing_history.shape[1]
-        flux_terms = [(initial_forcing, initial_time_index, 0.5)] + [
-            (
-                forcing_history[:, history_step],
-                forcing_time_indices[:, history_step],
-                0.5 if history_step == n_history - 1 else 1.0,
-            )
-            for history_step in range(n_history)
-        ]
-
-        flux_integral_global = pred_t.new_zeros(content_change_global.shape)
-        for flux_norm, flux_time_index, trapezoid_weight in flux_terms:
-            # Multi-channel forcing arrives as (B, C, H, W): keep only this
-            # budget's flux channel, since flux_std is that variable's std and
-            # the other forcings (e.g. wind stress) have no place in the budget.
-            # Single-channel forcing is already (B, H, W) or (B, 1, H, W).
-            if flux_norm.ndim == 4 and flux_norm.shape[1] > 1:
-                flux_norm = flux_norm[:, flux_channel_index]
-            flux_norm = squeeze_field_axes(flux_norm)  # (B, H, W) z-score
-            flux_std_t = flux_std[flux_time_index].to(device=pred_t.device, dtype=pred_t.dtype)
-            # z-score * std = physical flux anomaly (e.g. W/m^2); again no "+ mean".
-            flux_anom = flux_norm * flux_std_t
-
-            # e.g. W/m^2 * m^2 * s -> J, times the trapezoid weight (1/2 at the
-            # two ends of the window, 1 in between). surface_flux_sign flips the
-            # convention if positive flux means leaving the ocean.
-            flux_integral_global = flux_integral_global + (
-                (flux_anom * area_t).sum(dim=(-2, -1))
+        if closure_flux is not None and budget in closure_flux:
+            # Precomputed: the area-integrated flux anomaly of every month
+            # (see global_flux_by_month), summed over the window with the same
+            # trapezoid weights. The flux side depends only on the true forcing
+            # and the months, so re-integrating every month of the window at
+            # every step (quadratic in the rollout length) is not needed.
+            flux_integral_global = (
+                window_flux_integral(closure_flux[budget], initial_time_index, target_time_index)
                 * dt_seconds
-                * trapezoid_weight
                 * surface_flux_sign
-            )
+            ).to(pred_t.dtype)
+        else:
+            if initial_forcing is None:
+                raise ValueError(
+                    f"The {name} needs `initial_forcing`: the forcing in the "
+                    "initial month (time index target_time_indices[:, 0] - 1). The "
+                    "two-month flux average uses half of it for the first step. Add it "
+                    "to the rollout batch and pass it to total_rollout_loss."
+                )
+            if flux_std is None:
+                raise ValueError(f"The {name} needs closure_flux[{budget!r}], or a flux std in closure_std[{budget!r}]")
+            n_history = forcing_history.shape[1]
+            flux_terms = [(initial_forcing, initial_time_index, 0.5)] + [
+                (
+                    forcing_history[:, history_step],
+                    forcing_time_indices[:, history_step],
+                    0.5 if history_step == n_history - 1 else 1.0,
+                )
+                for history_step in range(n_history)
+            ]
+
+            flux_integral_global = pred_t.new_zeros(content_change_global.shape)
+            for flux_norm, flux_time_index, trapezoid_weight in flux_terms:
+                # Multi-channel forcing arrives as (B, C, H, W): keep only this
+                # budget's flux channel, since flux_std is that variable's std and
+                # the other forcings (e.g. wind stress) have no place in the budget.
+                # Single-channel forcing is already (B, H, W) or (B, 1, H, W).
+                if flux_norm.ndim == 4 and flux_norm.shape[1] > 1:
+                    flux_norm = flux_norm[:, flux_channel_index]
+                flux_norm = squeeze_field_axes(flux_norm)  # (B, H, W) z-score
+                flux_std_t = flux_std[flux_time_index].to(device=pred_t.device, dtype=pred_t.dtype)
+                # z-score * std = physical flux anomaly (e.g. W/m^2); again no "+ mean".
+                flux_anom = flux_norm * flux_std_t
+
+                # e.g. W/m^2 * m^2 * s -> J, times the trapezoid weight (1/2 at the
+                # two ends of the window, 1 in between). surface_flux_sign flips the
+                # convention if positive flux means leaving the ocean.
+                flux_integral_global = flux_integral_global + (
+                    (flux_anom * area_t).sum(dim=(-2, -1))
+                    * dt_seconds
+                    * trapezoid_weight
+                    * surface_flux_sign
+                )
 
         # --- Normalised squared residual -------------------------------------
         # Residual in content units x m^2 (e.g. J). Divide by the typical
@@ -531,6 +587,7 @@ def total_rollout_loss(
     initial_forcing=None,
     n_prognostic=1,
     closure_std=None,
+    closure_flux=None,
     checkpoint_steps=False,
     steps_in_memory=0,
 ):
@@ -557,6 +614,9 @@ def total_rollout_loss(
     ``closure_std`` is {budget: (content_std, flux_std)} for the closure losses
     built with a budget name (heat_closure_loss, freshwater_closure_loss, ...).
     ``ohc_std`` / ``forcing_std`` serve the original global_closure_loss.
+    ``closure_flux`` is {budget: (T,) area-integrated flux anomaly per month}
+    (global_flux_by_month); with it the closure terms skip re-integrating the
+    forcing of the whole window at every step.
 
     ``checkpoint_steps=True`` recomputes each step's model activations during
     the backward pass instead of keeping them (gradient checkpointing): peak
@@ -620,6 +680,7 @@ def total_rollout_loss(
             forcing_mean=forcing_mean,
             forcing_std=forcing_std,
             closure_std=closure_std,
+            closure_flux=closure_flux,
             dt_seconds=dt_seconds,
             initial_forcing=initial_forcing,
         )

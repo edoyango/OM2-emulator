@@ -567,6 +567,41 @@ def test_custom_budget_becomes_a_loss_term(synthetic_file, tmp_path):
     assert set(cfg.active_closures()) == {"fw2"}
 
 
+def test_precomputed_closure_flux_matches_integrating_the_forcing(synthetic_file, tmp_path):
+    """The closure terms are the same from the per-month global flux as from integrating the forcing at every step."""
+    from Emulator import total_rollout_loss
+    from Experiment.losses import closure_std_fields
+
+    cfg = closure_cfg(synthetic_file, tmp_path, {"local_mse": 1.0, "heat_closure": 0.1, "freshwater_closure": 0.3})
+    data = build_data(cfg, verbose=False)
+    model, losses = build_model(cfg, data), build_losses(cfg, data)
+    module = build_module(cfg, model, losses, data)
+    batch = data.windows(next(iter(data.train_dl)))
+    values = []
+    for closure in (dict(closure_std=module.closure_std, closure_flux=module.closure_flux),
+                    dict(closure_std={b: (c.float(), f.float()) for b, (c, f) in closure_std_fields(cfg, data).items()})):
+        with torch.no_grad():
+            total_rollout_loss(
+                model=model,
+                initial_prior_states=batch["prior"].flatten(1, 2),
+                forcing_sequence=batch["forcing"],
+                target_sequence=batch["target"],
+                mask=module.mask,
+                losses=losses,
+                n_steps=4,
+                target_time_indices=batch["target_time_index"],
+                area=module.area,
+                dt_seconds=cfg.loss.seconds_per_step,
+                initial_forcing=batch["initial_forcing"],
+                n_prognostic=data.n_prognostic,
+                **closure,
+            )
+        values.append({term.name: term.pop_running() for term in losses})
+    for name in ("heat_closure", "freshwater_closure"):
+        assert values[0][name] > 0
+        torch.testing.assert_close(values[0][name], values[1][name], rtol=1e-5, atol=0)
+
+
 def test_heat_and_freshwater_closures_train_with_independent_weights(synthetic_file, tmp_path):
     cfg = closure_cfg(synthetic_file, tmp_path,
                       {"local_mse": 1.0, "heat_closure": 0.1, "freshwater_closure": [0.0, 0.0, 0.3, 0.3]})
@@ -788,6 +823,7 @@ def test_checkpointed_rollout_gives_same_loss_and_gradients(data_and_cfg):
             target_time_indices=batch["target_time_index"],
             area=module.area,
             closure_std=module.closure_std,
+            closure_flux=module.closure_flux,
             dt_seconds=cfg.loss.seconds_per_step,
             initial_forcing=batch["initial_forcing"],
             n_prognostic=data.n_prognostic,
