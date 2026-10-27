@@ -23,3 +23,10 @@ Run from the repo root on a GPU node, with nothing else on the GPU:
   timings, then the skill test, written to `runs/bench/NAME/`. Use it to
   compare changes that alter training (batch size, learning rate) on skill as
   well as time.
+- `bench/summarise_runs.py runs/bench/A runs/bench/B ...`: side-by-side
+  training time, epoch time per rollout stage, final validation RMSE and
+  skill-test metrics of `run_timed.py` results.
+- `bench/gadi_compare.pbs`: a Gadi batch job comparing the original code
+  (`1dcbae8`) with a given commit on one GPU, per batch and end to end:
+  `qsub -q gpuhopper -P tm70 -v OPTIMISED=$(git rev-parse HEAD) bench/gadi_compare.pbs`
+  (from the repo root; results in `runs/bench/<queue>_<job id>/`).

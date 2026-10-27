@@ -1,0 +1,86 @@
+#!/bin/bash
+# Training performance on one Gadi GPU: the original code against the
+# optimised code, per batch (step_bench.py) and end to end (run_timed.py,
+# 20 epochs plus the skill test). Both versions are taken from git (ORIGINAL,
+# OPTIMISED) and run with the benchmark scripts of OPTIMISED, so the working
+# tree does not matter. Results: runs/bench/<queue>_<job id>/ in the repo.
+#
+# Submit from the repo root, e.g. on an H200:
+#   qsub -q gpuhopper -P tm70 -v OPTIMISED=$(git rev-parse HEAD) bench/gadi_compare.pbs
+# Needs the repo's .venv and emulator_cache/ (see bench/README.md); the
+# storage line must cover the repo, the venv and the data file.
+#PBS -q gpuhopper
+#PBS -l ngpus=1,ncpus=12,mem=96GB,jobfs=20GB,walltime=02:00:00
+#PBS -l storage=scratch/tm70+gdata/nm47
+#PBS -l wd
+#PBS -j oe
+#PBS -N om2-bench
+
+set -euo pipefail
+REPO=${PBS_O_WORKDIR:-$PWD}
+ORIGINAL=$(git -C "$REPO" rev-parse "${ORIGINAL:-1dcbae8}")
+OPTIMISED=$(git -C "$REPO" rev-parse "${OPTIMISED:-HEAD}")
+QUEUE=${PBS_QUEUE:-local}
+OUT=$REPO/runs/bench/${QUEUE%-exec}_${PBS_JOBID%%.*}
+mkdir -p "$OUT"
+
+module load python3/3.11.7
+PY=$REPO/.venv/bin/python
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+CACHE=$REPO/emulator_cache
+
+{
+    echo "original  $ORIGINAL"
+    echo "optimised $OPTIMISED"
+    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
+} | tee "$OUT/versions.txt"
+
+# Each version extracted to the job's local disk, with OPTIMISED's bench/.
+WORK=${PBS_JOBFS:-$(mktemp -d)}
+for name in original optimised; do
+    commit=$([ "$name" = original ] && echo "$ORIGINAL" || echo "$OPTIMISED")
+    mkdir -p "$WORK/$name"
+    git -C "$REPO" archive "$commit" | tar -x -C "$WORK/$name"
+    git -C "$REPO" archive "$OPTIMISED" bench | tar -x -C "$WORK/$name"
+done
+
+# The original configuration (the notebook before these changes); the
+# optimised notebook's own is batch 32 without rollout checkpointing.
+ORIGINAL_CONFIG=(--set train.batch_size=64 --set train.checkpoint_rollout_steps=True --set train.rollout_steps_in_memory=2)
+
+step_bench() {  # label, version, step_bench.py arguments...
+    local label=$1 version=$2
+    shift 2
+    echo "===== $label" | tee -a "$OUT/step_bench.txt"
+    "$PY" "$WORK/$version/bench/step_bench.py" --set "data.cache_dir=$CACHE" "$@" 2>&1 \
+        | grep -E "^(GPU|train|val) |Overrides|Error" | tee -a "$OUT/step_bench.txt" || true
+}
+
+run_timed() {  # name, version, run_timed.py arguments...
+    local name=$1 version=$2
+    shift 2
+    echo "===== run_timed $name"
+    "$PY" "$WORK/$version/bench/run_timed.py" --name "$name" --set "data.cache_dir=$CACHE" "$@" \
+        > "$OUT/$name.log" 2>&1 || echo "$name failed: see $OUT/$name.log"
+    if [ -d "$WORK/$version/runs/bench/$name" ]; then
+        cp -r "$WORK/$version/runs/bench/$name" "$OUT/"
+        rm -rf "$OUT/$name/checkpoints"
+    fi
+}
+
+# Per batch.
+step_bench "original code, original config" original
+step_bench "optimised code, original config" optimised "${ORIGINAL_CONFIG[@]}"
+step_bench "optimised code, notebook config" optimised
+for batch in 16 64 128; do
+    step_bench "optimised code, batch $batch, no rollout checkpointing" optimised --steps 1 12 24+12 \
+        --set "train.batch_size=$batch" --set train.checkpoint_rollout_steps=False
+done
+
+# End to end.
+run_timed baseline original
+run_timed optimised_original_config optimised "${ORIGINAL_CONFIG[@]}"
+run_timed optimised optimised
+run_timed optimised_batch64 optimised --set train.batch_size=64 --set train.checkpoint_rollout_steps=False
+
+"$PY" "$WORK/optimised/bench/summarise_runs.py" "$OUT"/*/ | tee "$OUT/summary.txt"
